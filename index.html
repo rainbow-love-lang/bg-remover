@@ -28,7 +28,7 @@
   #status.error { color: #ff8a80; }
 
   #stage {
-    position: relative;
+    position: relative; width: 100%;
     border-radius: 12px; overflow: hidden;
     background-color: #ffffff;
     background-image:
@@ -38,9 +38,10 @@
     background-position: 0 0, 10px 10px;
     display: none;
     touch-action: none;
+    overscroll-behavior: contain;
   }
-  #view, #overlay { display: block; width: 100%; height: auto; }
-  #overlay { position: absolute; inset: 0; pointer-events: none; }
+  #wrap { position: absolute; inset: 0; transform-origin: 0 0; }
+  #view, #overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
 
   .tools { display: none; flex-direction: column; gap: 12px; }
   .seg { display: flex; gap: 8px; }
@@ -55,6 +56,7 @@
   .row { display: flex; gap: 10px; }
   .row .btn { flex: 1; }
   .hidden { display: none !important; }
+  #zoomInfo { font-size: 12px; color: #9aa0a6; text-align: right; }
 </style>
 </head>
 <body>
@@ -67,11 +69,14 @@
 <div id="status">準備中…</div>
 
 <div id="stage">
-  <canvas id="view"></canvas>
-  <canvas id="overlay"></canvas>
+  <div id="wrap">
+    <canvas id="view"></canvas>
+    <canvas id="overlay"></canvas>
+  </div>
 </div>
 
 <div class="tools" id="tools">
+  <div id="zoomInfo">拡大 1.0倍 ／ 2本指で拡大・移動</div>
   <div class="seg">
     <button id="modeErase" class="on">消す</button>
     <button id="modeRestore">戻す</button>
@@ -83,6 +88,7 @@
   </div>
   <div class="row">
     <button class="btn sub" id="undo">1つ戻す</button>
+    <button class="btn sub" id="fit">表示を戻す</button>
     <button class="btn sub" id="reset">やり直し</button>
   </div>
   <div class="row">
@@ -92,22 +98,26 @@
 </div>
 
 <script type="module">
-// 編集時の最大サイズ（大きすぎるとスマホが重くなるため）。上げたいときはこの数字を変える
+// 編集時の最大サイズ（大きすぎるとスマホが重くなる）。上げたいときはこの数字を変える
 const MAX_SIDE = 2048;
 const MAX_UNDO = 8;
+const MAX_ZOOM = 10;
 
 const fileInput = document.getElementById('file');
 const pickLabel = document.getElementById('pickLabel');
 const statusEl  = document.getElementById('status');
 const stageEl   = document.getElementById('stage');
+const wrapEl    = document.getElementById('wrap');
 const viewEl    = document.getElementById('view');
 const overlayEl = document.getElementById('overlay');
 const toolsEl   = document.getElementById('tools');
+const zoomInfo  = document.getElementById('zoomInfo');
 const eraseBtn  = document.getElementById('modeErase');
 const restoreBtn= document.getElementById('modeRestore');
 const brushEl   = document.getElementById('brush');
 const brushVal  = document.getElementById('brushVal');
 const undoBtn   = document.getElementById('undo');
+const fitBtn    = document.getElementById('fit');
 const resetBtn  = document.getElementById('reset');
 const saveBtn   = document.getElementById('save');
 const shareBtn  = document.getElementById('share');
@@ -122,8 +132,16 @@ let history    = [];
 let removeBackground = null;
 let busy = false;
 let mode = 'erase';
+
+// 表示変形
+let scale = 1, tx = 0, ty = 0;
+
+// 入力管理
+const pointers = new Map();
 let drawing = false;
 let lastPt = null;
+let pinch = null;
+let suppressDraw = false;
 
 function setStatus(text, isError) {
   statusEl.textContent = text;
@@ -169,9 +187,9 @@ fileInput.addEventListener('change', async () => {
     const cutBmp  = await createImageBitmap(blob, { imageOrientation: 'from-image' });
     const origBmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
 
-    const scale = Math.min(1, MAX_SIDE / Math.max(cutBmp.width, cutBmp.height));
-    const w = Math.max(1, Math.round(cutBmp.width  * scale));
-    const h = Math.max(1, Math.round(cutBmp.height * scale));
+    const s = Math.min(1, MAX_SIDE / Math.max(cutBmp.width, cutBmp.height));
+    const w = Math.max(1, Math.round(cutBmp.width  * s));
+    const h = Math.max(1, Math.round(cutBmp.height * s));
 
     cutCanvas = newCanvas(w, h);
     cutCanvas.getContext('2d').drawImage(cutBmp, 0, 0, w, h);
@@ -188,9 +206,12 @@ fileInput.addEventListener('change', async () => {
 
     cutBmp.close(); origBmp.close();
 
+    stageEl.style.aspectRatio = w + ' / ' + h;
+    resetTransform();
+
     stageEl.style.display = 'block';
     toolsEl.style.display = 'flex';
-    setStatus('完了。残った部分は「消す」でなぞってください');
+    setStatus('完了。2本指で拡大して、残った部分をなぞってください');
   } catch (e) {
     setStatus('処理に失敗しました: ' + e.message, true);
   } finally {
@@ -199,6 +220,56 @@ fileInput.addEventListener('change', async () => {
     fileInput.value = '';
   }
 });
+
+/* ---------- 表示（拡大・移動） ---------- */
+
+function applyTransform() {
+  const r = stageEl.getBoundingClientRect();
+  if (scale <= 1) { scale = 1; tx = 0; ty = 0; }
+  else {
+    tx = Math.min(0, Math.max(r.width  * (1 - scale), tx));
+    ty = Math.min(0, Math.max(r.height * (1 - scale), ty));
+  }
+  wrapEl.style.transform = 'translate(' + tx + 'px,' + ty + 'px) scale(' + scale + ')';
+  zoomInfo.textContent = '拡大 ' + scale.toFixed(1) + '倍 ／ 2本指で拡大・移動';
+}
+function resetTransform() {
+  scale = 1; tx = 0; ty = 0;
+  applyTransform();
+}
+fitBtn.addEventListener('click', resetTransform);
+
+function stagePoint(clientX, clientY) {
+  const r = stageEl.getBoundingClientRect();
+  return { x: clientX - r.left, y: clientY - r.top };
+}
+function twoPointerInfo() {
+  const [a, b] = [...pointers.values()];
+  const dx = a.clientX - b.clientX, dy = a.clientY - b.clientY;
+  return {
+    dist: Math.hypot(dx, dy) || 1,
+    mid: stagePoint((a.clientX + b.clientX) / 2, (a.clientY + b.clientY) / 2)
+  };
+}
+function startPinch() {
+  const info = twoPointerInfo();
+  pinch = {
+    dist0: info.dist, mid0: info.mid,
+    scale0: scale, tx0: tx, ty0: ty
+  };
+}
+function updatePinch() {
+  if (!pinch) return;
+  const info = twoPointerInfo();
+  const next = Math.min(MAX_ZOOM, Math.max(1, pinch.scale0 * (info.dist / pinch.dist0)));
+  // ピンチ開始時に指の中心にあった点を保ったまま拡大する
+  const px = (pinch.mid0.x - pinch.tx0) / pinch.scale0;
+  const py = (pinch.mid0.y - pinch.ty0) / pinch.scale0;
+  scale = next;
+  tx = info.mid.x - px * next;
+  ty = info.mid.y - py * next;
+  applyTransform();
+}
 
 /* ---------- ブラシ ---------- */
 
@@ -219,7 +290,7 @@ function toCanvasPt(e) {
   };
 }
 function brushSize() {
-  // 表示サイズではなく実ピクセル基準に換算
+  // 画面上の太さを一定に保つため、実ピクセル基準に換算する
   const rect = viewEl.getBoundingClientRect();
   const ratio = rect.width ? (viewEl.width / rect.width) : 1;
   return Number(brushEl.value) * ratio;
@@ -229,6 +300,13 @@ function pushHistory() {
   snap.getContext('2d').drawImage(viewEl, 0, 0);
   history.push(snap);
   if (history.length > MAX_UNDO) history.shift();
+}
+function popHistory() {
+  const snap = history.pop();
+  if (!snap) return false;
+  vctx.clearRect(0, 0, viewEl.width, viewEl.height);
+  vctx.drawImage(snap, 0, 0);
+  return true;
 }
 function strokePath(ctx, a, b, size) {
   ctx.lineWidth = size;
@@ -263,53 +341,101 @@ function paintSegment(a, b) {
     vctx.restore();
   }
 }
-function drawRing(pt) {
+function clearRing() {
   octx.clearRect(0, 0, overlayEl.width, overlayEl.height);
+}
+function drawRing(pt) {
+  clearRing();
   if (!pt) return;
   octx.beginPath();
   octx.arc(pt.x, pt.y, brushSize() / 2, 0, Math.PI * 2);
   octx.strokeStyle = mode === 'erase' ? 'rgba(255,80,80,0.95)' : 'rgba(80,180,255,0.95)';
-  octx.lineWidth = Math.max(2, brushSize() * 0.03);
+  octx.lineWidth = Math.max(1, brushSize() * 0.03);
   octx.stroke();
+}
+function startStroke(e) {
+  drawing = true;
+  pushHistory();
+  lastPt = toCanvasPt(e);
+  paintSegment(lastPt, lastPt);
+  drawRing(lastPt);
+}
+function cancelStroke() {
+  // 2本目の指が触れた瞬間についた点を取り消す
+  if (!drawing) return;
+  drawing = false;
+  lastPt = null;
+  popHistory();
+  clearRing();
+}
+function endStroke() {
+  drawing = false;
+  lastPt = null;
+  clearRing();
 }
 
 stageEl.addEventListener('pointerdown', (e) => {
   if (!cutCanvas) return;
   e.preventDefault();
   stageEl.setPointerCapture(e.pointerId);
-  drawing = true;
-  pushHistory();
-  lastPt = toCanvasPt(e);
-  paintSegment(lastPt, lastPt);
-  drawRing(lastPt);
+  pointers.set(e.pointerId, e);
+
+  if (pointers.size === 1 && !suppressDraw) {
+    startStroke(e);
+  } else if (pointers.size === 2) {
+    cancelStroke();
+    suppressDraw = true;
+    startPinch();
+  }
 });
+
 stageEl.addEventListener('pointermove', (e) => {
   if (!cutCanvas) return;
+  if (pointers.has(e.pointerId)) pointers.set(e.pointerId, e);
+
+  if (pointers.size >= 2) { updatePinch(); return; }
+
   const pt = toCanvasPt(e);
   if (drawing) {
     paintSegment(lastPt, pt);
     lastPt = pt;
   }
-  drawRing(pt);
-});
-function endStroke(e) {
-  if (!drawing) return;
-  drawing = false;
-  lastPt = null;
-  octx.clearRect(0, 0, overlayEl.width, overlayEl.height);
-}
-stageEl.addEventListener('pointerup', endStroke);
-stageEl.addEventListener('pointercancel', endStroke);
-stageEl.addEventListener('pointerleave', () => {
-  if (!drawing) octx.clearRect(0, 0, overlayEl.width, overlayEl.height);
+  if (pointers.size === 1 || e.pointerType === 'mouse') drawRing(pt);
 });
 
+function pointerEnd(e) {
+  pointers.delete(e.pointerId);
+  if (pointers.size < 2) pinch = null;
+  if (pointers.size === 0) { endStroke(); suppressDraw = false; }
+  else if (suppressDraw) { endStroke(); }
+}
+stageEl.addEventListener('pointerup', pointerEnd);
+stageEl.addEventListener('pointercancel', pointerEnd);
+stageEl.addEventListener('pointerleave', (e) => {
+  if (e.pointerType === 'mouse' && !drawing) clearRing();
+});
+
+// パソコン用：ホイールで拡大縮小
+stageEl.addEventListener('wheel', (e) => {
+  if (!cutCanvas) return;
+  e.preventDefault();
+  const m = stagePoint(e.clientX, e.clientY);
+  const px = (m.x - tx) / scale;
+  const py = (m.y - ty) / scale;
+  const next = Math.min(MAX_ZOOM, Math.max(1, scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+  scale = next;
+  tx = m.x - px * next;
+  ty = m.y - py * next;
+  applyTransform();
+}, { passive: false });
+
+window.addEventListener('resize', applyTransform);
+
+/* ---------- 元に戻す・やり直し ---------- */
+
 undoBtn.addEventListener('click', () => {
-  const snap = history.pop();
-  if (!snap) { setStatus('これ以上は戻せません'); return; }
-  vctx.clearRect(0, 0, viewEl.width, viewEl.height);
-  vctx.drawImage(snap, 0, 0);
-  setStatus('1つ戻しました');
+  if (popHistory()) setStatus('1つ戻しました');
+  else setStatus('これ以上は戻せません');
 });
 resetBtn.addEventListener('click', () => {
   if (!cutCanvas) return;
