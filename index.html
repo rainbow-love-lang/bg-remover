@@ -8,35 +8,50 @@
   :root { color-scheme: dark; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   body {
-    margin: 0; padding: 20px 16px 40px;
+    margin: 0; padding: 16px 14px 40px;
     font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans JP", sans-serif;
     background: #14161a; color: #e8eaed;
-    display: flex; flex-direction: column; gap: 16px;
+    display: flex; flex-direction: column; gap: 14px;
     min-height: 100vh;
   }
   h1 { font-size: 18px; margin: 0; font-weight: 600; letter-spacing: .02em; }
   .btn {
-    display: block; width: 100%; padding: 16px;
+    display: block; width: 100%; padding: 15px;
     border: none; border-radius: 12px;
     background: #3b6cf0; color: #fff;
     font-size: 16px; font-weight: 600; text-align: center;
     cursor: pointer;
   }
-  .btn.sub { background: #2a2e35; color: #e8eaed; }
-  .btn:disabled { opacity: .4; }
+  .btn.sub { background: #2a2e35; color: #e8eaed; font-size: 14px; padding: 13px; }
   #file { display: none; }
-  #status { font-size: 14px; color: #9aa0a6; min-height: 20px; white-space: pre-wrap; }
+  #status { font-size: 13px; color: #9aa0a6; min-height: 18px; white-space: pre-wrap; }
   #status.error { color: #ff8a80; }
+
   #stage {
-    border-radius: 12px; overflow: hidden; background-color: #ffffff;
+    position: relative;
+    border-radius: 12px; overflow: hidden;
+    background-color: #ffffff;
     background-image:
       linear-gradient(45deg, #ccc 25%, transparent 25%, transparent 75%, #ccc 75%),
       linear-gradient(45deg, #ccc 25%, transparent 25%, transparent 75%, #ccc 75%);
     background-size: 20px 20px;
     background-position: 0 0, 10px 10px;
     display: none;
+    touch-action: none;
   }
-  #stage img { display: block; width: 100%; height: auto; }
+  #view, #overlay { display: block; width: 100%; height: auto; }
+  #overlay { position: absolute; inset: 0; pointer-events: none; }
+
+  .tools { display: none; flex-direction: column; gap: 12px; }
+  .seg { display: flex; gap: 8px; }
+  .seg button {
+    flex: 1; padding: 13px; border-radius: 12px; border: 1px solid #2a2e35;
+    background: #1c1f25; color: #9aa0a6; font-size: 15px; font-weight: 600; cursor: pointer;
+  }
+  .seg button.on { background: #3b6cf0; border-color: #3b6cf0; color: #fff; }
+  .slider { display: flex; align-items: center; gap: 12px; }
+  .slider label { font-size: 13px; color: #9aa0a6; white-space: nowrap; }
+  input[type=range] { flex: 1; accent-color: #3b6cf0; }
   .row { display: flex; gap: 10px; }
   .row .btn { flex: 1; }
   .hidden { display: none !important; }
@@ -51,40 +66,80 @@
 
 <div id="status">準備中…</div>
 
-<div id="stage"><img id="result" alt="結果"></div>
+<div id="stage">
+  <canvas id="view"></canvas>
+  <canvas id="overlay"></canvas>
+</div>
 
-<div class="row hidden" id="actions">
-  <button class="btn sub" id="save">PNGで保存</button>
-  <button class="btn sub hidden" id="share">共有</button>
+<div class="tools" id="tools">
+  <div class="seg">
+    <button id="modeErase" class="on">消す</button>
+    <button id="modeRestore">戻す</button>
+  </div>
+  <div class="slider">
+    <label>ブラシ</label>
+    <input type="range" id="brush" min="6" max="160" value="40">
+    <label id="brushVal">40</label>
+  </div>
+  <div class="row">
+    <button class="btn sub" id="undo">1つ戻す</button>
+    <button class="btn sub" id="reset">やり直し</button>
+  </div>
+  <div class="row">
+    <button class="btn sub" id="save">PNGで保存</button>
+    <button class="btn sub hidden" id="share">共有</button>
+  </div>
 </div>
 
 <script type="module">
+// 編集時の最大サイズ（大きすぎるとスマホが重くなるため）。上げたいときはこの数字を変える
+const MAX_SIDE = 2048;
+const MAX_UNDO = 8;
+
 const fileInput = document.getElementById('file');
 const pickLabel = document.getElementById('pickLabel');
 const statusEl  = document.getElementById('status');
 const stageEl   = document.getElementById('stage');
-const resultEl  = document.getElementById('result');
-const actionsEl = document.getElementById('actions');
+const viewEl    = document.getElementById('view');
+const overlayEl = document.getElementById('overlay');
+const toolsEl   = document.getElementById('tools');
+const eraseBtn  = document.getElementById('modeErase');
+const restoreBtn= document.getElementById('modeRestore');
+const brushEl   = document.getElementById('brush');
+const brushVal  = document.getElementById('brushVal');
+const undoBtn   = document.getElementById('undo');
+const resetBtn  = document.getElementById('reset');
 const saveBtn   = document.getElementById('save');
 const shareBtn  = document.getElementById('share');
 
-let resultBlob = null;
-let resultUrl  = null;
+const vctx = viewEl.getContext('2d');
+const octx = overlayEl.getContext('2d');
+
+let origCanvas = null;   // 元写真
+let cutCanvas  = null;   // 透過直後の状態
+let tmpCanvas  = null;   // ブラシ合成用
+let history    = [];
 let removeBackground = null;
 let busy = false;
+let mode = 'erase';
+let drawing = false;
+let lastPt = null;
 
 function setStatus(text, isError) {
   statusEl.textContent = text;
   statusEl.classList.toggle('error', !!isError);
+}
+function newCanvas(w, h) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  return c;
 }
 
 // ライブラリ読み込み（export名の違いを両方吸収する）
 try {
   const mod = await import('https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.5.5/+esm');
   removeBackground = mod.removeBackground || mod.default;
-  if (typeof removeBackground !== 'function') {
-    throw new Error('ライブラリの関数が見つかりません');
-  }
+  if (typeof removeBackground !== 'function') throw new Error('ライブラリの関数が見つかりません');
   setStatus('写真を選んでください');
 } catch (e) {
   setStatus('ライブラリの読み込みに失敗しました。通信環境を確認して再読み込みしてください。\n' + e.message, true);
@@ -96,10 +151,9 @@ fileInput.addEventListener('change', async () => {
 
   busy = true;
   pickLabel.style.opacity = '0.4';
-  actionsEl.classList.add('hidden');
+  toolsEl.style.display = 'none';
   stageEl.style.display = 'none';
-  if (resultUrl) { URL.revokeObjectURL(resultUrl); resultUrl = null; }
-  resultBlob = null;
+  history = [];
   setStatus('処理中… 初回はモデルのダウンロードで時間がかかります');
 
   try {
@@ -112,12 +166,31 @@ fileInput.addEventListener('change', async () => {
       }
     });
 
-    resultBlob = blob;
-    resultUrl = URL.createObjectURL(blob);
-    resultEl.src = resultUrl;
+    const cutBmp  = await createImageBitmap(blob, { imageOrientation: 'from-image' });
+    const origBmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+
+    const scale = Math.min(1, MAX_SIDE / Math.max(cutBmp.width, cutBmp.height));
+    const w = Math.max(1, Math.round(cutBmp.width  * scale));
+    const h = Math.max(1, Math.round(cutBmp.height * scale));
+
+    cutCanvas = newCanvas(w, h);
+    cutCanvas.getContext('2d').drawImage(cutBmp, 0, 0, w, h);
+
+    origCanvas = newCanvas(w, h);
+    origCanvas.getContext('2d').drawImage(origBmp, 0, 0, w, h);
+
+    tmpCanvas = newCanvas(w, h);
+
+    viewEl.width = w; viewEl.height = h;
+    overlayEl.width = w; overlayEl.height = h;
+    vctx.clearRect(0, 0, w, h);
+    vctx.drawImage(cutCanvas, 0, 0);
+
+    cutBmp.close(); origBmp.close();
+
     stageEl.style.display = 'block';
-    actionsEl.classList.remove('hidden');
-    setStatus('完了しました');
+    toolsEl.style.display = 'flex';
+    setStatus('完了。残った部分は「消す」でなぞってください');
   } catch (e) {
     setStatus('処理に失敗しました: ' + e.message, true);
   } finally {
@@ -127,25 +200,158 @@ fileInput.addEventListener('change', async () => {
   }
 });
 
-saveBtn.addEventListener('click', () => {
-  if (!resultUrl) return;
-  const a = document.createElement('a');
-  a.href = resultUrl;
-  a.download = 'transparent-' + Date.now() + '.png';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
+/* ---------- ブラシ ---------- */
+
+function setMode(m) {
+  mode = m;
+  eraseBtn.classList.toggle('on', m === 'erase');
+  restoreBtn.classList.toggle('on', m === 'restore');
+}
+eraseBtn.addEventListener('click', () => setMode('erase'));
+restoreBtn.addEventListener('click', () => setMode('restore'));
+brushEl.addEventListener('input', () => { brushVal.textContent = brushEl.value; });
+
+function toCanvasPt(e) {
+  const rect = viewEl.getBoundingClientRect();
+  return {
+    x: (e.clientX - rect.left) * (viewEl.width  / rect.width),
+    y: (e.clientY - rect.top)  * (viewEl.height / rect.height)
+  };
+}
+function brushSize() {
+  // 表示サイズではなく実ピクセル基準に換算
+  const rect = viewEl.getBoundingClientRect();
+  const ratio = rect.width ? (viewEl.width / rect.width) : 1;
+  return Number(brushEl.value) * ratio;
+}
+function pushHistory() {
+  const snap = newCanvas(viewEl.width, viewEl.height);
+  snap.getContext('2d').drawImage(viewEl, 0, 0);
+  history.push(snap);
+  if (history.length > MAX_UNDO) history.shift();
+}
+function strokePath(ctx, a, b, size) {
+  ctx.lineWidth = size;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.lineTo(b.x, b.y);
+  ctx.stroke();
+}
+function paintSegment(a, b) {
+  const size = brushSize();
+  if (mode === 'erase') {
+    vctx.save();
+    vctx.globalCompositeOperation = 'destination-out';
+    vctx.strokeStyle = 'rgba(0,0,0,1)';
+    strokePath(vctx, a, b, size);
+    vctx.restore();
+  } else {
+    const tctx = tmpCanvas.getContext('2d');
+    tctx.save();
+    tctx.globalCompositeOperation = 'source-over';
+    tctx.clearRect(0, 0, tmpCanvas.width, tmpCanvas.height);
+    tctx.strokeStyle = '#fff';
+    strokePath(tctx, a, b, size);
+    tctx.globalCompositeOperation = 'source-in';
+    tctx.drawImage(origCanvas, 0, 0);
+    tctx.restore();
+    vctx.save();
+    vctx.globalCompositeOperation = 'source-over';
+    vctx.drawImage(tmpCanvas, 0, 0);
+    vctx.restore();
+  }
+}
+function drawRing(pt) {
+  octx.clearRect(0, 0, overlayEl.width, overlayEl.height);
+  if (!pt) return;
+  octx.beginPath();
+  octx.arc(pt.x, pt.y, brushSize() / 2, 0, Math.PI * 2);
+  octx.strokeStyle = mode === 'erase' ? 'rgba(255,80,80,0.95)' : 'rgba(80,180,255,0.95)';
+  octx.lineWidth = Math.max(2, brushSize() * 0.03);
+  octx.stroke();
+}
+
+stageEl.addEventListener('pointerdown', (e) => {
+  if (!cutCanvas) return;
+  e.preventDefault();
+  stageEl.setPointerCapture(e.pointerId);
+  drawing = true;
+  pushHistory();
+  lastPt = toCanvasPt(e);
+  paintSegment(lastPt, lastPt);
+  drawRing(lastPt);
+});
+stageEl.addEventListener('pointermove', (e) => {
+  if (!cutCanvas) return;
+  const pt = toCanvasPt(e);
+  if (drawing) {
+    paintSegment(lastPt, pt);
+    lastPt = pt;
+  }
+  drawRing(pt);
+});
+function endStroke(e) {
+  if (!drawing) return;
+  drawing = false;
+  lastPt = null;
+  octx.clearRect(0, 0, overlayEl.width, overlayEl.height);
+}
+stageEl.addEventListener('pointerup', endStroke);
+stageEl.addEventListener('pointercancel', endStroke);
+stageEl.addEventListener('pointerleave', () => {
+  if (!drawing) octx.clearRect(0, 0, overlayEl.width, overlayEl.height);
 });
 
-// 共有はスマホで対応している場合だけ表示
+undoBtn.addEventListener('click', () => {
+  const snap = history.pop();
+  if (!snap) { setStatus('これ以上は戻せません'); return; }
+  vctx.clearRect(0, 0, viewEl.width, viewEl.height);
+  vctx.drawImage(snap, 0, 0);
+  setStatus('1つ戻しました');
+});
+resetBtn.addEventListener('click', () => {
+  if (!cutCanvas) return;
+  pushHistory();
+  vctx.clearRect(0, 0, viewEl.width, viewEl.height);
+  vctx.drawImage(cutCanvas, 0, 0);
+  setStatus('透過直後の状態に戻しました');
+});
+
+/* ---------- 保存 ---------- */
+
+function currentBlob() {
+  return new Promise((resolve, reject) => {
+    viewEl.toBlob((b) => b ? resolve(b) : reject(new Error('画像の書き出しに失敗しました')), 'image/png');
+  });
+}
+saveBtn.addEventListener('click', async () => {
+  if (!cutCanvas) return;
+  try {
+    const blob = await currentBlob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'transparent-' + Date.now() + '.png';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (e) {
+    setStatus(e.message, true);
+  }
+});
+
 if (navigator.canShare) {
   const probe = new File([new Blob()], 'p.png', { type: 'image/png' });
   if (navigator.canShare({ files: [probe] })) {
     shareBtn.classList.remove('hidden');
     shareBtn.addEventListener('click', async () => {
-      if (!resultBlob) return;
+      if (!cutCanvas) return;
       try {
-        const f = new File([resultBlob], 'transparent.png', { type: 'image/png' });
+        const blob = await currentBlob();
+        const f = new File([blob], 'transparent.png', { type: 'image/png' });
         await navigator.share({ files: [f] });
       } catch (e) { /* キャンセル時は何もしない */ }
     });
