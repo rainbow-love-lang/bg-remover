@@ -24,7 +24,7 @@
   }
   .btn.sub { background: #2a2e35; color: #e8eaed; font-size: 14px; padding: 13px; }
   #file { display: none; }
-  #status { font-size: 13px; color: #9aa0a6; min-height: 18px; white-space: pre-wrap; line-height: 1.6; }
+  #status { font-size: 13px; color: #9aa0a6; min-height: 18px; white-space: pre-wrap; }
   #status.error { color: #ff8a80; }
 
   #stage {
@@ -125,7 +125,7 @@ const shareBtn  = document.getElementById('share');
 const vctx = viewEl.getContext('2d');
 const octx = overlayEl.getContext('2d');
 
-let origCanvas = null;   // 元写真（標準形式に変換済み）
+let origCanvas = null;   // 元写真
 let cutCanvas  = null;   // 透過直後の状態
 let tmpCanvas  = null;   // ブラシ合成用
 let history    = [];
@@ -152,11 +152,6 @@ function newCanvas(w, h) {
   c.width = w; c.height = h;
   return c;
 }
-function canvasToBlob(canvas, type, quality) {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((b) => b ? resolve(b) : reject(new Error('画像の変換に失敗しました')), type, quality);
-  });
-}
 
 // ライブラリ読み込み（export名の違いを両方吸収する）
 try {
@@ -168,28 +163,6 @@ try {
   setStatus('ライブラリの読み込みに失敗しました。通信環境を確認して再読み込みしてください。\n' + e.message, true);
 }
 
-// 選んだ写真をブラウザで開いて、標準形式のキャンバスに正規化する
-async function loadNormalized(file) {
-  let bmp;
-  try {
-    bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
-  } catch (e) {
-    const t = file.type || '不明';
-    throw new Error(
-      'この写真は開けませんでした（形式: ' + t + '）。\n' +
-      'RAW（DNG）などブラウザが対応していない形式です。同じ写真のJPEG版を選ぶか、' +
-      'カメラの設定でRAW保存をオフにしてください。'
-    );
-  }
-  const s = Math.min(1, MAX_SIDE / Math.max(bmp.width, bmp.height));
-  const w = Math.max(1, Math.round(bmp.width  * s));
-  const h = Math.max(1, Math.round(bmp.height * s));
-  const c = newCanvas(w, h);
-  c.getContext('2d').drawImage(bmp, 0, 0, w, h);
-  bmp.close();
-  return c;
-}
-
 fileInput.addEventListener('change', async () => {
   const file = fileInput.files && fileInput.files[0];
   if (!file || !removeBackground || busy) return;
@@ -199,18 +172,10 @@ fileInput.addEventListener('change', async () => {
   toolsEl.style.display = 'none';
   stageEl.style.display = 'none';
   history = [];
-  setStatus('画像を読み込み中…');
+  setStatus('処理中… 初回はモデルのダウンロードで時間がかかります');
 
   try {
-    // 1. 正規化（ここでRAWなど非対応形式をはじく）
-    const src = await loadNormalized(file);
-    const w = src.width, h = src.height;
-
-    // 2. 標準形式に変換したものを解析にかける
-    setStatus('処理中… 初回はモデルのダウンロードで時間がかかります');
-    const srcBlob = await canvasToBlob(src, 'image/png');
-
-    const blob = await removeBackground(srcBlob, {
+    const blob = await removeBackground(file, {
       output: { format: 'image/png' },
       progress: (key, current, total) => {
         const pct = total ? Math.round((current / total) * 100) : 0;
@@ -219,19 +184,27 @@ fileInput.addEventListener('change', async () => {
       }
     });
 
-    // 3. 結果を元写真と同じ寸法で保持する
-    const cutBmp = await createImageBitmap(blob);
+    const cutBmp  = await createImageBitmap(blob, { imageOrientation: 'from-image' });
+    const origBmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+
+    const s = Math.min(1, MAX_SIDE / Math.max(cutBmp.width, cutBmp.height));
+    const w = Math.max(1, Math.round(cutBmp.width  * s));
+    const h = Math.max(1, Math.round(cutBmp.height * s));
+
     cutCanvas = newCanvas(w, h);
     cutCanvas.getContext('2d').drawImage(cutBmp, 0, 0, w, h);
-    cutBmp.close();
 
-    origCanvas = src;
-    tmpCanvas  = newCanvas(w, h);
+    origCanvas = newCanvas(w, h);
+    origCanvas.getContext('2d').drawImage(origBmp, 0, 0, w, h);
+
+    tmpCanvas = newCanvas(w, h);
 
     viewEl.width = w; viewEl.height = h;
     overlayEl.width = w; overlayEl.height = h;
     vctx.clearRect(0, 0, w, h);
     vctx.drawImage(cutCanvas, 0, 0);
+
+    cutBmp.close(); origBmp.close();
 
     stageEl.style.aspectRatio = w + ' / ' + h;
     resetTransform();
@@ -240,7 +213,7 @@ fileInput.addEventListener('change', async () => {
     toolsEl.style.display = 'flex';
     setStatus('完了。2本指で拡大して、残った部分をなぞってください');
   } catch (e) {
-    setStatus(e.message, true);
+    setStatus('処理に失敗しました: ' + e.message, true);
   } finally {
     busy = false;
     pickLabel.style.opacity = '1';
@@ -280,12 +253,16 @@ function twoPointerInfo() {
 }
 function startPinch() {
   const info = twoPointerInfo();
-  pinch = { dist0: info.dist, mid0: info.mid, scale0: scale, tx0: tx, ty0: ty };
+  pinch = {
+    dist0: info.dist, mid0: info.mid,
+    scale0: scale, tx0: tx, ty0: ty
+  };
 }
 function updatePinch() {
   if (!pinch) return;
   const info = twoPointerInfo();
   const next = Math.min(MAX_ZOOM, Math.max(1, pinch.scale0 * (info.dist / pinch.dist0)));
+  // ピンチ開始時に指の中心にあった点を保ったまま拡大する
   const px = (pinch.mid0.x - pinch.tx0) / pinch.scale0;
   const py = (pinch.mid0.y - pinch.ty0) / pinch.scale0;
   scale = next;
@@ -313,6 +290,7 @@ function toCanvasPt(e) {
   };
 }
 function brushSize() {
+  // 画面上の太さを一定に保つため、実ピクセル基準に換算する
   const rect = viewEl.getBoundingClientRect();
   const ratio = rect.width ? (viewEl.width / rect.width) : 1;
   return Number(brushEl.value) * ratio;
@@ -383,6 +361,7 @@ function startStroke(e) {
   drawRing(lastPt);
 }
 function cancelStroke() {
+  // 2本目の指が触れた瞬間についた点を取り消す
   if (!drawing) return;
   drawing = false;
   lastPt = null;
@@ -412,4 +391,99 @@ stageEl.addEventListener('pointerdown', (e) => {
 
 stageEl.addEventListener('pointermove', (e) => {
   if (!cutCanvas) return;
-  if (poi
+  if (pointers.has(e.pointerId)) pointers.set(e.pointerId, e);
+
+  if (pointers.size >= 2) { updatePinch(); return; }
+
+  const pt = toCanvasPt(e);
+  if (drawing) {
+    paintSegment(lastPt, pt);
+    lastPt = pt;
+  }
+  if (pointers.size === 1 || e.pointerType === 'mouse') drawRing(pt);
+});
+
+function pointerEnd(e) {
+  pointers.delete(e.pointerId);
+  if (pointers.size < 2) pinch = null;
+  if (pointers.size === 0) { endStroke(); suppressDraw = false; }
+  else if (suppressDraw) { endStroke(); }
+}
+stageEl.addEventListener('pointerup', pointerEnd);
+stageEl.addEventListener('pointercancel', pointerEnd);
+stageEl.addEventListener('pointerleave', (e) => {
+  if (e.pointerType === 'mouse' && !drawing) clearRing();
+});
+
+// パソコン用：ホイールで拡大縮小
+stageEl.addEventListener('wheel', (e) => {
+  if (!cutCanvas) return;
+  e.preventDefault();
+  const m = stagePoint(e.clientX, e.clientY);
+  const px = (m.x - tx) / scale;
+  const py = (m.y - ty) / scale;
+  const next = Math.min(MAX_ZOOM, Math.max(1, scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+  scale = next;
+  tx = m.x - px * next;
+  ty = m.y - py * next;
+  applyTransform();
+}, { passive: false });
+
+window.addEventListener('resize', applyTransform);
+
+/* ---------- 元に戻す・やり直し ---------- */
+
+undoBtn.addEventListener('click', () => {
+  if (popHistory()) setStatus('1つ戻しました');
+  else setStatus('これ以上は戻せません');
+});
+resetBtn.addEventListener('click', () => {
+  if (!cutCanvas) return;
+  pushHistory();
+  vctx.clearRect(0, 0, viewEl.width, viewEl.height);
+  vctx.drawImage(cutCanvas, 0, 0);
+  setStatus('透過直後の状態に戻しました');
+});
+
+/* ---------- 保存 ---------- */
+
+function currentBlob() {
+  return new Promise((resolve, reject) => {
+    viewEl.toBlob((b) => b ? resolve(b) : reject(new Error('画像の書き出しに失敗しました')), 'image/png');
+  });
+}
+saveBtn.addEventListener('click', async () => {
+  if (!cutCanvas) return;
+  try {
+    const blob = await currentBlob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'transparent-' + Date.now() + '.png';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (e) {
+    setStatus(e.message, true);
+  }
+});
+
+if (navigator.canShare) {
+  const probe = new File([new Blob()], 'p.png', { type: 'image/png' });
+  if (navigator.canShare({ files: [probe] })) {
+    shareBtn.classList.remove('hidden');
+    shareBtn.addEventListener('click', async () => {
+      if (!cutCanvas) return;
+      try {
+        const blob = await currentBlob();
+        const f = new File([blob], 'transparent.png', { type: 'image/png' });
+        await navigator.share({ files: [f] });
+      } catch (e) { /* キャンセル時は何もしない */ }
+    });
+  }
+}
+</script>
+
+</body>
+</html>
